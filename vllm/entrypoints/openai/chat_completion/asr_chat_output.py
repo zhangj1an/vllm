@@ -24,9 +24,9 @@ def postprocess_chat_completion_text_for_model(
     if text is None:
         return None
     from vllm.model_executor.model_loader import get_model_cls
-    from vllm.model_executor.models.interfaces import SupportsTranscription
+    from vllm.model_executor.models.interfaces import supports_transcription
 
     model_cls = get_model_cls(model_config)
-    if issubclass(model_cls, SupportsTranscription):
+    if supports_transcription(model_cls):
         return model_cls.post_process_output(text)
     return text
