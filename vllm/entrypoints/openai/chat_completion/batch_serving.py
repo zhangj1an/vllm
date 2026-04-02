@@ -15,6 +15,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseChoice,
     ChatMessage,
 )
+from vllm.entrypoints.openai.chat_completion.asr_chat_output import (
+    postprocess_chat_completion_text_for_model,
+)
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
@@ -271,6 +274,10 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 else:
                     reasoning = None
                     content = output.text
+
+                content = postprocess_chat_completion_text_for_model(
+                    self.model_config, content
+                )
 
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
 

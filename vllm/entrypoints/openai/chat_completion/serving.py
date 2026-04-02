@@ -23,6 +23,9 @@ from vllm.entrypoints.chat_utils import (
     make_tool_call_id,
 )
 from vllm.entrypoints.logger import RequestLogger
+from vllm.entrypoints.openai.chat_completion.asr_chat_output import (
+    postprocess_chat_completion_text_for_model,
+)
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -1383,6 +1386,10 @@ class OpenAIServingChat(OpenAIServing):
             else:
                 reasoning = None
                 content = output.text
+
+            content = postprocess_chat_completion_text_for_model(
+                self.model_config, content
+            )
 
             auto_tools_called = False
             # if auto tools are not enabled, and a named tool choice using
