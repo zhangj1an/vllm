@@ -119,7 +119,7 @@ class TestFusedAddRMSNorm(torch.nn.Module):
 
     def example_inputs(self, batch_size=8, hidden_size=16, seq_len=16):
         hidden_states = torch.randn((batch_size * seq_len, hidden_size))
-        residual = torch.randn((batch_size * seq_len, hidden_size))
+        residual = torch.randn((batch_size * seq_len, self.intermediate_size))
         return (hidden_states, residual)
 
     def ops_in_model(self, do_fusion):
