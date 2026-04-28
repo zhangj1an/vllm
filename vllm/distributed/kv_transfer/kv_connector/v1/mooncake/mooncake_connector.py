@@ -1413,8 +1413,8 @@ class MooncakeConnectorWorker:
             block_size=self.block_size,
             engine_id=self.engine_id,
             is_mla=self.use_mla,
-            is_mamba=False,
-            total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
+            is_mamba=self.transfer_topo.is_mamba,
+            total_num_kv_heads=self.transfer_topo.total_num_kv_heads,
             attn_backends=self.transfer_topo.attn_backends,
             tensor_shape=first_cache.shape,
         )
