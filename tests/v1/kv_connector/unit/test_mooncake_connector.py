@@ -703,9 +703,7 @@ def test_register_cross_layers_kv_cache():
         assert registered_ptrs == [cross_layer_cache.data_ptr()]
         assert registered_lens == [cross_layer_cache.nbytes]
         assert worker.num_blocks == num_blocks
-        assert worker.block_len_per_layer == [
-            cross_layer_cache.nbytes // num_blocks
-        ]
+        assert worker.block_len_per_layer == [cross_layer_cache.nbytes // num_blocks]
         # Cross-layer mode must disable K/V splitting on dim 0.
         assert worker.transfer_topo.split_k_and_v is False
         assert worker.transfer_topo.cross_layers_blocks is True
