@@ -21,6 +21,8 @@ class RegisterWorkerPayload(BaseModel):
     dp_rank: int
     tp_rank: int
     pp_rank: int
+    pp_first_layer: int
+    num_pp_local_layers: int
     addr: WorkerAddr
 
 
@@ -29,6 +31,9 @@ class EngineEntry:
     engine_id: EngineId
     # {tp_rank: {pp_rank: worker_addr}}
     worker_addr: dict[int, dict[int, WorkerAddr]]
+    # {pp_rank: (first_layer, num_pp_local_layers)} — same for all tp_ranks of
+    # a given pp_rank, so we collapse on first registration.
+    pp_layer_ranges: dict[int, tuple[int, int]]
 
 
 class MooncakeBootstrapServer:
@@ -83,6 +88,7 @@ class MooncakeBootstrapServer:
             self.workers[payload.dp_rank] = EngineEntry(
                 engine_id=payload.engine_id,
                 worker_addr={},
+                pp_layer_ranges={},
             )
 
         dp_entry = self.workers[payload.dp_rank]
@@ -111,12 +117,29 @@ class MooncakeBootstrapServer:
             )
 
         tp_entry[payload.pp_rank] = payload.addr
+
+        layer_range = (payload.pp_first_layer, payload.num_pp_local_layers)
+        existing = dp_entry.pp_layer_ranges.get(payload.pp_rank)
+        if existing is None:
+            dp_entry.pp_layer_ranges[payload.pp_rank] = layer_range
+        elif existing != layer_range:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Inconsistent PP layer range for dp_rank={payload.dp_rank}, "
+                    f"pp_rank={payload.pp_rank}: previously registered "
+                    f"{existing}, now got {layer_range}"
+                ),
+            )
         logger.debug(
-            "Registered worker: engine_id=%s, dp_rank=%d, tp_rank=%d, pp_rank=%d at %s",
+            "Registered worker: engine_id=%s, dp_rank=%d, tp_rank=%d, "
+            "pp_rank=%d (layers %d..%d) at %s",
             payload.engine_id,
             payload.dp_rank,
             payload.tp_rank,
             payload.pp_rank,
+            payload.pp_first_layer,
+            payload.pp_first_layer + payload.num_pp_local_layers,
             payload.addr,
         )
 

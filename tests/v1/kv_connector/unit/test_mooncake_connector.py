@@ -180,6 +180,8 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "dp_rank": 0,
         "tp_rank": 0,
         "pp_rank": 0,
+        "pp_first_layer": 0,
+        "num_pp_local_layers": 4,
         "addr": "tcp://1.1.1.1:1111",
     }
     async with httpx.AsyncClient() as client:
@@ -195,6 +197,8 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         assert "0" in data
         assert data["0"]["engine_id"] == "eng-1"
         assert data["0"]["worker_addr"]["0"]["0"] == "tcp://1.1.1.1:1111"
+        # Layer ranges are exposed so consumers can route per-PP-rank.
+        assert data["0"]["pp_layer_ranges"]["0"] == [0, 4]
 
     # Test failure: re-registering the same worker
     async with httpx.AsyncClient() as client:
@@ -208,12 +212,32 @@ async def test_bootstrap_server(bootstrap_server: MooncakeBootstrapServer):
         "dp_rank": 0,
         "tp_rank": 1,
         "pp_rank": 0,
+        "pp_first_layer": 0,
+        "num_pp_local_layers": 4,
         "addr": "tcp://3.3.3.3:3333",
     }
     async with httpx.AsyncClient() as client:
         response = await client.post(f"{base_url}/register", json=payload3_fail)
         assert response.status_code == 400
         assert "Engine ID mismatch" in response.text
+
+    # Test failure: same pp_rank registered with a different layer range
+    # (e.g. producer/consumer disagree about layer partitioning).
+    payload_layer_mismatch = {
+        "engine_id": "eng-1",
+        "dp_rank": 0,
+        "tp_rank": 1,
+        "pp_rank": 0,
+        "pp_first_layer": 0,
+        "num_pp_local_layers": 8,
+        "addr": "tcp://1.1.1.1:2222",
+    }
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{base_url}/register", json=payload_layer_mismatch
+        )
+        assert response.status_code == 400
+        assert "Inconsistent PP layer range" in response.text
 
 
 def test_scheduler_request_finished():
@@ -829,6 +853,227 @@ async def test_kv_producer_heterogeneous_tp(monkeypatch, d_tp_size):
         # After serving all D ranks, the request should be complete
         assert transfer_id not in prefill_worker.reqs_need_send
         assert "p-req-h1" in prefill_worker.finished_sending_reqs
+
+        prefill_worker.sender_loop = origin_sender_loop
+        prefill_worker.shutdown()
+
+
+def _override_pp_state(
+    worker,
+    *,
+    pp_size: int,
+    pp_rank: int,
+    pp_first_layer: int,
+    num_pp_local_layers: int,
+    total_num_hidden_layers: int,
+    regions_per_layer: int = 1,
+    supports_heterogeneous_pp: bool = True,
+):
+    """Force a worker into a specific PP topology for unit tests.
+
+    The default `create_vllm_config` builds a PP=1 model and `register_kv_caches`
+    is bypassed in these tests, so we set every field that the production code
+    reads when routing a transfer.
+    """
+    worker.pp_size = pp_size
+    worker.pp_rank = pp_rank
+    worker.pp_first_layer = pp_first_layer
+    worker.pp_last_layer = pp_first_layer + num_pp_local_layers
+    worker.num_pp_local_layers = num_pp_local_layers
+    worker.total_num_hidden_layers = total_num_hidden_layers
+    worker.regions_per_layer = regions_per_layer
+    worker._supports_heterogeneous_pp = supports_heterogeneous_pp
+
+
+def test_pp_topology_validation():
+    """Bootstrap response validation should reject malformed PP partitions."""
+
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_consumer"
+    )
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        worker = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        ).connector_worker
+        worker.total_num_hidden_layers = 8
+
+        # Gap between slices: pp_rank 0 covers [0,4) but pp_rank 1 starts at 5.
+        with pytest.raises(ValueError, match="contiguous"):
+            worker._validate_remote_pp_topology("gap", {0: (0, 4), 1: (5, 3)})
+
+        # Total mismatch: slices cover 6 layers but model has 8.
+        with pytest.raises(ValueError, match="cover"):
+            worker._validate_remote_pp_topology("short", {0: (0, 3), 1: (3, 3)})
+
+        worker.shutdown()
+
+
+@pytest.mark.asyncio
+@patch(
+    "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+    "mooncake_connector.TransferEngine",
+    FakeMooncakeWrapper,
+)
+@pytest.mark.parametrize(
+    "p_pp_size,p_pp_rank,d_pp_size,d_pp_rank,"
+    "expected_local_addrs,expected_remote_addrs",
+    [
+        # PP_p=2 → PP_d=1: producer pp_rank=0 owns [0,2) of [0,4);
+        # consumer pp_rank=0 owns [0,4). Producer slices to [0,2), writing
+        # into consumer slots 0 and 1.
+        pytest.param(
+            2,
+            0,
+            1,
+            0,
+            [0x1000, 0x1100],  # producer's full [0,2) registration
+            [0x2000, 0x2100],  # first 2 of consumer's [0,4) registration
+            id="p_pp2_rank0_to_d_pp1",
+        ),
+        # PP_p=2 → PP_d=1: producer pp_rank=1 owns [2,4); writes into
+        # consumer slots 2 and 3.
+        pytest.param(
+            2,
+            1,
+            1,
+            0,
+            [0x1200, 0x1300],
+            [0x2200, 0x2300],
+            id="p_pp2_rank1_to_d_pp1",
+        ),
+        # PP_p=1 → PP_d=2: producer owns [0,4); consumer pp_rank=0 owns [0,2).
+        # Producer slices its registration to first 2 layers, writing into
+        # consumer's full [0,2) registration.
+        pytest.param(
+            1,
+            0,
+            2,
+            0,
+            [0x1000, 0x1100],
+            [0x2000, 0x2100],
+            id="p_pp1_to_d_pp2_rank0",
+        ),
+        # PP_p=1 → PP_d=2: consumer pp_rank=1 owns [2,4). Producer slices its
+        # registration to last 2 layers, writing into consumer's full
+        # [2,4) registration.
+        pytest.param(
+            1,
+            0,
+            2,
+            1,
+            [0x1200, 0x1300],
+            [0x2200, 0x2300],
+            id="p_pp1_to_d_pp2_rank1",
+        ),
+    ],
+)
+async def test_kv_producer_heterogeneous_pp(
+    monkeypatch,
+    p_pp_size,
+    p_pp_rank,
+    d_pp_size,
+    d_pp_rank,
+    expected_local_addrs,
+    expected_remote_addrs,
+):
+    """Producer with PP_p sends to consumer with PP_d ≠ PP_p. Each transfer
+    is restricted to the layer-slice intersection."""
+
+    monkeypatch.setenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", "5")
+    vllm_config = create_vllm_config(
+        kv_connector="MooncakeConnector", kv_role="kv_producer"
+    )
+    block_len = 4096
+    total_layers = 4
+
+    # Producer's registration covers its own slice; addresses are positioned
+    # so absolute layer L maps to producer base 0x1000 + L*0x100.
+    p_layers_per_rank = total_layers // p_pp_size
+    p_first = p_pp_rank * p_layers_per_rank
+    producer_base = [0x1000 + (p_first + i) * 0x100 for i in range(p_layers_per_rank)]
+
+    # Consumer's registration covers its own slice; addresses positioned so
+    # absolute layer L maps to consumer base 0x2000 + L*0x100.
+    d_layers_per_rank = total_layers // d_pp_size
+    d_first = d_pp_rank * d_layers_per_rank
+    consumer_base = [0x2000 + (d_first + i) * 0x100 for i in range(d_layers_per_rank)]
+
+    with set_current_vllm_config(vllm_config), patch_worker_dependencies():
+        prefill_worker = MooncakeConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            _make_test_kv_cache_config(),
+        ).connector_worker
+
+        _override_pp_state(
+            prefill_worker,
+            pp_size=p_pp_size,
+            pp_rank=p_pp_rank,
+            pp_first_layer=p_first,
+            num_pp_local_layers=p_layers_per_rank,
+            total_num_hidden_layers=total_layers,
+        )
+        prefill_worker.kv_caches_base_addr = list(producer_base)
+        prefill_worker.block_len_per_layer = [block_len] * p_layers_per_rank
+
+        origin_sender_loop = prefill_worker.sender_loop
+        prefill_worker.sender_loop = asyncio.get_event_loop()
+
+        transfer_id = f"xfer-hpp-{p_pp_size}{p_pp_rank}-{d_pp_size}{d_pp_rank}"
+        local_block_ids = [[10, 11]]
+        send_meta = SendBlockMeta(
+            p_req_id=f"p-req-hpp-{p_pp_rank}",
+            transfer_id=transfer_id,
+            local_block_ids=local_block_ids,
+            ready=asyncio.Event(),
+        )
+        prefill_worker.reqs_need_send[transfer_id] = send_meta
+        send_meta.ready.set()
+
+        xfer_meta = MooncakeXferMetadata(
+            remote_hostname="consumer-host",
+            remote_port=54321,
+            remote_tp_size=1,
+            remote_tp_rank=0,
+            req_blocks={"d-req-hpp": (transfer_id, [[20, 21]])},
+            kv_caches_base_addr=list(consumer_base),
+            block_lens=[block_len] * d_layers_per_rank,
+            remote_pp_size=d_pp_size,
+            remote_pp_rank=d_pp_rank,
+            remote_pp_first_layer=d_first,
+            remote_num_pp_layers=d_layers_per_rank,
+        )
+
+        mock_socket = AsyncMock(spec=zmq.asyncio.Socket)
+        mock_socket.send_multipart = AsyncMock()
+        identity = b"consumer-hpp"
+
+        with patch.object(
+            prefill_worker, "_send_blocks", return_value=0
+        ) as mock_send_blocks:
+            await prefill_worker.send_kv_to_decode(identity, mock_socket, xfer_meta)
+
+            mock_send_blocks.assert_called_once()
+            _, src_ptrs, dst_ptrs, lengths = mock_send_blocks.call_args[0]
+
+            # Two blocks per layer coalesce into one descriptor; one descriptor
+            # per layer in the overlap.
+            n_overlap = len(expected_local_addrs)
+            assert len(src_ptrs) == n_overlap
+            assert lengths == [2 * block_len] * n_overlap
+            for i, (src_base, dst_base) in enumerate(
+                zip(expected_local_addrs, expected_remote_addrs)
+            ):
+                assert src_ptrs[i] == src_base + 10 * block_len
+                assert dst_ptrs[i] == dst_base + 20 * block_len
+
+            mock_socket.send_multipart.assert_called_once()
+            _, sent_payload = mock_socket.send_multipart.call_args[0][0]
+            response = prefill_worker._xfer_resp_decoder.decode(sent_payload)
+            assert response.status == MooncakeXferResponseStatus.FINISH
+            assert response.ok_reqs == ["d-req-hpp"]
 
         prefill_worker.sender_loop = origin_sender_loop
         prefill_worker.shutdown()

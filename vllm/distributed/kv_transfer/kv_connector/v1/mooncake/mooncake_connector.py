@@ -260,8 +260,17 @@ class MooncakeXferMetadata(
     remote_tp_size: int
     remote_tp_rank: int
     req_blocks: dict[ReqId, tuple[TransferId, list[list[int]]]]
+    # kv_caches_base_addr / block_lens describe the consumer's (destination)
+    # KV registration. With pipeline parallelism, this only covers the layer
+    # slice owned by the consumer PP rank; the producer must intersect this
+    # with its own layer slice before emitting transfers.
     kv_caches_base_addr: list[int]
     block_lens: list[int]
+    # Consumer PP topology. Defaults preserve PP=1 wire compat with older peers.
+    remote_pp_size: int = 1
+    remote_pp_rank: int = 0
+    remote_pp_first_layer: int = 0
+    remote_num_pp_layers: int = 0
 
 
 class MooncakeXferResponseStatus(IntEnum):
@@ -788,12 +797,15 @@ class MooncakeConnectorWorker:
         dp_rank = parallel_config.data_parallel_index
         dp_local_rank = parallel_config.data_parallel_rank_local
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
-        pp_size = vllm_config.parallel_config.pipeline_parallel_size
-        if pp_size > 1:
-            raise ValueError(
-                "Mooncake Transfer Engine does not support pipeline parallelism yet."
-            )
+        self.pp_size = parallel_config.pipeline_parallel_size
         self.pp_rank = get_pp_group().rank_in_group
+        self.total_num_hidden_layers = (
+            vllm_config.model_config.get_total_num_hidden_layers()
+        )
+        self.pp_first_layer, self.pp_last_layer = (
+            vllm_config.model_config.get_layers_start_end_indices(parallel_config)
+        )
+        self.num_pp_local_layers = self.pp_last_layer - self.pp_first_layer
 
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
@@ -857,6 +869,15 @@ class MooncakeConnectorWorker:
         logger.debug("Detected kv cache layout %s", self.kv_cache_layout)
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.tp_size}
+        self._remote_pp_size: dict[EngineId, int] = {self.engine_id: self.pp_size}
+        # Per-remote-engine map of pp_rank -> (first_layer, num_pp_local_layers).
+        # Populated for the local engine immediately and for remotes after the
+        # bootstrap query in _connect_to_prefiller_bootstrap.
+        self._remote_pp_layer_ranges: dict[EngineId, dict[int, tuple[int, int]]] = {
+            self.engine_id: {
+                self.pp_rank: (self.pp_first_layer, self.num_pp_local_layers)
+            }
+        }
         self.transfer_topo = TransferTopology(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -918,6 +939,8 @@ class MooncakeConnectorWorker:
             dp_rank=self.dp_rank,
             tp_rank=self.tp_rank,
             pp_rank=self.pp_rank,
+            pp_first_layer=self.pp_first_layer,
+            num_pp_local_layers=self.num_pp_local_layers,
             addr=worker_addr,
         )
         while True:
@@ -1019,12 +1042,29 @@ class MooncakeConnectorWorker:
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
             return
-        local_regions = self._get_transfer_regions(
-            self.kv_caches_base_addr, self.block_len_per_layer
+        local_base, local_lens, remote_base, remote_lens, slice_err = (
+            self._slice_pp_overlap(meta)
         )
-        remote_regions = self._get_transfer_regions(
-            meta.kv_caches_base_addr, meta.block_lens
-        )
+        if slice_err is not None:
+            logger.error(slice_err)
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.ERROR,
+                err_msg=slice_err,
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
+        if not local_base:
+            # Layer overlap is empty — this consumer pulls nothing from this
+            # producer PP rank. Reply success so the consumer's pull-task
+            # counter advances.
+            response = MooncakeXferResponse(
+                status=MooncakeXferResponseStatus.FINISH,
+                ok_reqs=list(meta.req_blocks) or None,
+            )
+            await sock.send_multipart((identity, self._encoder.encode(response)))
+            return
+        local_regions = self._get_transfer_regions(local_base, local_lens)
+        remote_regions = self._get_transfer_regions(remote_base, remote_lens)
         validation_err = _validate_asymmetric_region_lengths(
             local_regions=local_regions,
             remote_regions=remote_regions,
@@ -1434,6 +1474,26 @@ class MooncakeConnectorWorker:
         self.kv_caches_base_addr = seen_base_addresses
         self.seen_base_addresses = seen_base_addresses
 
+        # Track entries-per-layer so the heterogeneous-PP path can slice
+        # `kv_caches_base_addr` / `block_len_per_layer` by absolute layer
+        # index. With split_k_and_v, K and V each get their own entry, so
+        # there are 2 entries per layer; otherwise 1.
+        num_registered = len(self.kv_caches_base_addr)
+        expected_per_layer_dense = (
+            2 if split_k_and_v else 1
+        ) * self.num_pp_local_layers
+        if num_registered == expected_per_layer_dense:
+            self.regions_per_layer = 2 if split_k_and_v else 1
+            self._supports_heterogeneous_pp = True
+        else:
+            # Cross-layer aliasing (e.g. HMA-style sharing) or other
+            # non-trivial layouts collapse multiple layers into fewer
+            # registrations. We can still do matched PP (since both sides
+            # see the same collapsed shape) but the per-layer slicing
+            # required by heterogeneous PP doesn't apply.
+            self.regions_per_layer = 0
+            self._supports_heterogeneous_pp = False
+
         ret_value = self.engine.batch_register_memory(kv_data_ptrs, kv_data_lens)
         if ret_value != 0:
             raise RuntimeError("Mooncake batch memory registration failed.")
@@ -1442,9 +1502,12 @@ class MooncakeConnectorWorker:
         assert self.num_blocks != 0
         self.device_kv_caches = kv_caches
         logger.debug(
-            "registered num_blocks=%d block_lens=%s",
+            "registered num_blocks=%d block_lens=%s "
+            "regions_per_layer=%d num_pp_local_layers=%d",
             self.num_blocks,
             self.block_len_per_layer,
+            self.regions_per_layer,
+            self.num_pp_local_layers,
         )
 
         # No need to launch server for D node.
@@ -1547,6 +1610,10 @@ class MooncakeConnectorWorker:
             },
             kv_caches_base_addr=self.kv_caches_base_addr,
             block_lens=self.block_len_per_layer,
+            remote_pp_size=self.pp_size,
+            remote_pp_rank=self.pp_rank,
+            remote_pp_first_layer=self.pp_first_layer,
+            remote_num_pp_layers=self.num_pp_local_layers,
         )
 
         encoded_data = self._encoder.encode(metadata)
@@ -1629,6 +1696,16 @@ class MooncakeConnectorWorker:
                         for tp_rank, tp_entry in dp_entry["worker_addr"].items()
                     }
                     self._tp_size[remote_engine_id] = len(dp_entry["worker_addr"])
+                    raw_layer_ranges = dp_entry.get("pp_layer_ranges") or {}
+                    layer_ranges: dict[int, tuple[int, int]] = {
+                        int(pp_rank): (int(first), int(num))
+                        for pp_rank, (first, num) in raw_layer_ranges.items()
+                    }
+                    self._remote_pp_layer_ranges[remote_engine_id] = layer_ranges
+                    self._remote_pp_size[remote_engine_id] = (
+                        len(layer_ranges) if layer_ranges else 1
+                    )
+                    self._validate_remote_pp_topology(remote_engine_id, layer_ranges)
         except Exception as e:
             logger.error(
                 "Failed to connect to bootstrap server %s: %s",
@@ -1648,19 +1725,37 @@ class MooncakeConnectorWorker:
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(
             self._tp_size[remote_engine_id]
         )
-        count = len(remote_tp_ranks)
+        overlapping_pp_ranks = self._overlapping_remote_pp_ranks(remote_engine_id)
+        if not overlapping_pp_ranks:
+            logger.error(
+                "No producer PP rank on engine %s overlaps the local layer "
+                "slice [%d, %d); pulls cannot proceed.",
+                remote_engine_id,
+                self.pp_first_layer,
+                self.pp_last_layer,
+            )
+            return
+
+        target_count = len(remote_tp_ranks) * len(overlapping_pp_ranks)
         logger.debug(
-            "Receiving Mooncake KV for engine %s from producer TP ranks %s",
+            "Receiving Mooncake KV for engine %s from producer TP ranks %s "
+            "and PP ranks %s (local pp_rank=%d layers [%d, %d))",
             remote_engine_id,
             remote_tp_ranks,
+            overlapping_pp_ranks,
+            self.pp_rank,
+            self.pp_first_layer,
+            self.pp_last_layer,
         )
         for pull_meta in pull_metas.values():
-            pull_meta.pull_tasks_count = count
+            pull_meta.pull_tasks_count = target_count
         for remote_tp_rank in remote_tp_ranks:
-            worker_addr = self._remote_agents[remote_engine_id][remote_tp_rank][0]
-            asyncio.create_task(
-                self.receive_kv_from_single_worker(worker_addr, pull_metas)
-            )
+            tp_entry = self._remote_agents[remote_engine_id][remote_tp_rank]
+            for remote_pp_rank in overlapping_pp_ranks:
+                worker_addr = tp_entry[remote_pp_rank]
+                asyncio.create_task(
+                    self.receive_kv_from_single_worker(worker_addr, pull_metas)
+                )
 
     async def handle_new_engine_id(
         self,
@@ -1746,6 +1841,143 @@ class MooncakeConnectorWorker:
             base_addrs=base_addrs,
             block_lens=block_lens,
             is_kv_layout_blocks_first=self.transfer_topo.is_kv_layout_blocks_first,
+        )
+
+    def _compute_pp_layer_overlap(
+        self, remote_first: int, remote_num: int
+    ) -> tuple[int, int] | None:
+        """Intersection of the local PP layer slice with [remote_first,
+        remote_first + remote_num). Returns (overlap_first, overlap_num)
+        in absolute layer indices, or None if there is no overlap."""
+        remote_last = remote_first + remote_num
+        overlap_first = max(self.pp_first_layer, remote_first)
+        overlap_last = min(self.pp_last_layer, remote_last)
+        if overlap_first >= overlap_last:
+            return None
+        return overlap_first, overlap_last - overlap_first
+
+    def _validate_remote_pp_topology(
+        self,
+        remote_engine_id: EngineId,
+        layer_ranges: dict[int, tuple[int, int]],
+    ) -> None:
+        """Verify a remote engine's PP layer ranges form a contiguous
+        partition of [0, total_num_hidden_layers). Mutates
+        `_remote_pp_layer_ranges[remote_engine_id]` to fall back to a
+        single-PP-rank entry if the remote registered no layer info
+        (older peer)."""
+        if not layer_ranges:
+            self._remote_pp_layer_ranges[remote_engine_id] = {
+                0: (0, self.total_num_hidden_layers)
+            }
+            self._remote_pp_size[remote_engine_id] = 1
+            return
+        cursor = 0
+        for pp_rank, (first, num) in sorted(layer_ranges.items()):
+            if first != cursor:
+                raise ValueError(
+                    f"Remote engine {remote_engine_id} PP rank {pp_rank} "
+                    f"layer range starts at {first}, expected {cursor}; "
+                    "PP layer partitions must be contiguous and ordered."
+                )
+            cursor += num
+        if cursor != self.total_num_hidden_layers:
+            raise ValueError(
+                f"Remote engine {remote_engine_id} PP slices cover "
+                f"{cursor} layers but the local model has "
+                f"{self.total_num_hidden_layers}. Producer and consumer "
+                "must run the same model architecture."
+            )
+
+    def _overlapping_remote_pp_ranks(self, remote_engine_id: EngineId) -> list[int]:
+        """Producer pp_ranks whose layer slice intersects this consumer
+        worker's slice, in ascending pp_rank order."""
+        layer_ranges = self._remote_pp_layer_ranges.get(remote_engine_id, {})
+        return sorted(
+            pp_rank
+            for pp_rank, (first, num) in layer_ranges.items()
+            if self._compute_pp_layer_overlap(first, num) is not None
+        )
+
+    def _slice_pp_overlap(
+        self, meta: MooncakeXferMetadata
+    ) -> tuple[list[int], list[int], list[int], list[int], str | None]:
+        """Restrict producer + consumer KV registrations to the layer
+        overlap described in `meta`. Returns sliced
+        (local_base, local_lens, remote_base, remote_lens, err). Empty
+        lists with err=None mean no layer overlap (caller should reply
+        success without transferring). err!=None means the configuration
+        is invalid; caller must reply with an error."""
+        # Peers using msgspec defaults (or older clients without PP info)
+        # report num_pp_layers=0; treat this as PP=1 covering all layers.
+        consumer_first = meta.remote_pp_first_layer
+        consumer_num = meta.remote_num_pp_layers
+        if consumer_num == 0:
+            consumer_first = 0
+            consumer_num = self.total_num_hidden_layers
+
+        # Cross-layer-aliased layouts can't be sliced per layer. Allow the
+        # transfer only when the consumer's slice exactly matches this
+        # producer's slice (matched PP, paired on the same layer range).
+        if not self._supports_heterogeneous_pp:
+            if (
+                consumer_first != self.pp_first_layer
+                or consumer_num != self.num_pp_local_layers
+            ):
+                return (
+                    [],
+                    [],
+                    [],
+                    [],
+                    (
+                        "Mooncake: this KV cache layout requires matched "
+                        "pipeline parallelism (consumer slice must equal "
+                        "producer slice); got local layers "
+                        f"[{self.pp_first_layer}, {self.pp_last_layer}) vs "
+                        f"remote layers [{consumer_first}, "
+                        f"{consumer_first + consumer_num})."
+                    ),
+                )
+            return (
+                list(self.kv_caches_base_addr),
+                list(self.block_len_per_layer),
+                list(meta.kv_caches_base_addr),
+                list(meta.block_lens),
+                None,
+            )
+
+        overlap = self._compute_pp_layer_overlap(consumer_first, consumer_num)
+        if overlap is None:
+            return [], [], [], [], None
+
+        overlap_first, overlap_num = overlap
+        regions_per_layer = self.regions_per_layer
+        local_lo = (overlap_first - self.pp_first_layer) * regions_per_layer
+        local_hi = local_lo + overlap_num * regions_per_layer
+        remote_lo = (overlap_first - consumer_first) * regions_per_layer
+        remote_hi = remote_lo + overlap_num * regions_per_layer
+
+        if local_hi > len(self.kv_caches_base_addr) or remote_hi > len(
+            meta.kv_caches_base_addr
+        ):
+            return (
+                [],
+                [],
+                [],
+                [],
+                (
+                    "Mooncake: computed PP overlap region exceeds registered "
+                    "KV ranges; producer and consumer must agree on layer "
+                    "partitioning."
+                ),
+            )
+
+        return (
+            list(self.kv_caches_base_addr[local_lo:local_hi]),
+            list(self.block_len_per_layer[local_lo:local_hi]),
+            list(meta.kv_caches_base_addr[remote_lo:remote_hi]),
+            list(meta.block_lens[remote_lo:remote_hi]),
+            None,
         )
 
     def _get_sender_transfer_plan(
