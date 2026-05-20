@@ -1056,6 +1056,7 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async("get_supported_tasks")
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
+        breakpoint()  # HTTP Stage 4 (ZMQ submit): EngineCoreRequest sent across processes to EngineCore
         request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, request)
         self._ensure_output_queue_task()

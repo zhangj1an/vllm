@@ -296,7 +296,7 @@ class AsyncLLM(EngineClient):
         reasoning_parser_kwargs: dict[str, Any] | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
-
+        breakpoint()  # HTTP Stage 3 (AsyncLLM): request enters engine, input processing
         if self.errored:
             raise EngineDeadError()
 

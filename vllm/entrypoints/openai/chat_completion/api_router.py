@@ -51,6 +51,7 @@ def batch_chat(request: Request) -> OpenAIServingChatBatch | None:
 @with_cancellation
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+    breakpoint()  # HTTP Stage 1 (FastAPI route): inspect raw_request, ChatCompletionRequest body
     metrics_header_format = raw_request.headers.get(
         ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
     )

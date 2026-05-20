@@ -218,6 +218,7 @@ class LLMEngine:
         priority: int = 0,
         prompt_text: str | None = None,
     ) -> str:
+        breakpoint()  # Stage 4 (submit): inspect EngineCoreRequest fields
         # Validate the request_id type.
         if not isinstance(request_id, str):
             raise TypeError(f"request_id must be a string, got {type(request_id)}")

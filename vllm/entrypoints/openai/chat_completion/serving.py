@@ -243,6 +243,7 @@ class OpenAIServingChat(OpenAIServing):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
+        breakpoint()  # HTTP Stage 2 (OpenAI handler): chat templating, sampling params, request_id
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None

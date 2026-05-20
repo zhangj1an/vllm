@@ -621,6 +621,7 @@ class OutputProcessor:
         If you need to touch every element of the batch, do it from
         within the loop below.
         """
+        breakpoint()  # Stage 10 (detokenize): EngineCoreOutput -> RequestOutput
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []

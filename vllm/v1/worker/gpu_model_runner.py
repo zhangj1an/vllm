@@ -1825,6 +1825,7 @@ class GPUModelRunner(
             logits_indices, spec_decode_metadata,
         ]
         """
+        breakpoint()  # Stage 6 (input prep): inspect input_ids, positions, query_start_loc
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -4114,6 +4115,7 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            breakpoint()  # Stage 7 (forward): inspect inputs_embeds.shape, hidden states
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4206,6 +4208,7 @@ class GPUModelRunner(
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        breakpoint()  # Stage 8 (sample): inspect logits, then sampled_token_ids after _sample()
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
