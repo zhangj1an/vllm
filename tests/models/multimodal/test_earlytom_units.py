@@ -7,7 +7,7 @@ Run directly: .venv/bin/python tests/models/multimodal/test_earlytom_units.py
 
 import torch
 
-from vllm.model_executor.models.earlytom import (
+from vllm.multimodal.earlytom import (
     EarlyTomConfig,
     EarlyTomVideoAux,
     ema_segments,

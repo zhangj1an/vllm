@@ -66,13 +66,10 @@ from vllm.model_executor.layers.rotary_embedding.common import (
     ApplyRotaryEmb,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.earlytom import (
-    EarlyTomConfig,
-    EarlyTomEncoderState,
-    outer_compress,
-)
+from vllm.model_executor.models.earlytom import EarlyTomEncoderState
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.earlytom import EarlyTomConfig, outer_compress
 from vllm.multimodal.evs import (
     compute_mrope_for_media,
     compute_retained_tokens_count,
