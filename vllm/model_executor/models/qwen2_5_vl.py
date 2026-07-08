@@ -66,8 +66,10 @@ from vllm.model_executor.layers.rotary_embedding.common import (
     ApplyRotaryEmb,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.earlytom import EarlyTomEncoderState
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.earlytom import EarlyTomConfig, outer_compress
 from vllm.multimodal.evs import (
     compute_mrope_for_media,
     compute_retained_tokens_count,
@@ -1059,7 +1061,18 @@ class Qwen2_5_VisionTransformer(nn.Module):
         grid_thw: list[list[int]] | None,
         *,
         encoder_metadata: dict[str, torch.Tensor] | None = None,
+        earlytom_cfg: EarlyTomConfig | None = None,
     ) -> torch.Tensor:
+        # EarlyTom in-encoder temporal frame merging + saliency capture.
+        # State survives this forward only; aux is picked up by the caller
+        # via pop_earlytom_aux().
+        self._earlytom_aux = None
+        et_state = (
+            EarlyTomEncoderState(earlytom_cfg, self, grid_thw)
+            if earlytom_cfg is not None
+            else None
+        )
+
         hidden_states = x.to(device=self.device, dtype=self.dtype)
         hidden_states = self.patch_embed(hidden_states)
 
@@ -1096,6 +1109,13 @@ class Qwen2_5_VisionTransformer(nn.Module):
                 max_seqlen_now = max_seqlen_window
                 sequence_lengths_now = sequence_lengths_window
 
+            # EarlyTom: read this layer's attention pattern as the token
+            # saliency signal (head/query-averaged, recomputed from QK^T).
+            if et_state is not None and layer_num == et_state.saliency_layer:
+                et_state.capture_saliency(
+                    blk, hidden_states, rotary_pos_emb_cos, rotary_pos_emb_sin
+                )
+
             hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens_now,
@@ -1105,15 +1125,47 @@ class Qwen2_5_VisionTransformer(nn.Module):
                 sequence_lengths=sequence_lengths_now,
             )
 
+            # EarlyTom: merge temporally-redundant frames at the configured
+            # layers so the remaining encoder layers process fewer tokens.
+            if et_state is not None and layer_num in earlytom_cfg.prune_layers:
+                (
+                    hidden_states,
+                    rotary_pos_emb_cos,
+                    rotary_pos_emb_sin,
+                    et_meta,
+                ) = et_state.merge_after_layer(
+                    hidden_states,
+                    rotary_pos_emb_cos,
+                    rotary_pos_emb_sin,
+                    last=layer_num == max(earlytom_cfg.prune_layers),
+                )
+                cu_seqlens = et_meta["cu_seqlens"]
+                cu_window_seqlens = et_meta["cu_window_seqlens"]
+                max_seqlen_full = et_meta["max_seqlen_full"]
+                max_seqlen_window = et_meta["max_seqlen_window"]
+                sequence_lengths_full = et_meta["sequence_lengths_full"]
+                sequence_lengths_window = et_meta["sequence_lengths_window"]
+
         # For Qwen2.5-VL-3B, float16 will overflow at last block
         # for long visual tokens sequences.
         if hidden_states.dtype == torch.float16:
             hidden_states = cast_overflow_tensors(hidden_states)
 
+        if et_state is not None:
+            reverse_indices = et_state.final_reverse_indices(
+                hidden_states.device
+            )
+            self._earlytom_aux = et_state.build_aux()
+
         # adapter
         hidden_states = self.merger(hidden_states)
         hidden_states = hidden_states[reverse_indices, :]
         return hidden_states
+
+    def pop_earlytom_aux(self):
+        aux = getattr(self, "_earlytom_aux", None)
+        self._earlytom_aux = None
+        return aux
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -1370,6 +1422,19 @@ class Qwen2_5_VLForConditionalGeneration(
         self.is_multimodal_pruning_enabled = (
             multimodal_config.is_multimodal_pruning_enabled()
         )
+        self.earlytom_cfg = EarlyTomConfig.from_env()
+        if self.earlytom_cfg is not None:
+            if not self.is_multimodal_pruning_enabled:
+                logger.warning(
+                    "VLLM_EARLYTOM=1 requires --video-pruning-rate > 0; "
+                    "EarlyTom is disabled."
+                )
+                self.earlytom_cfg = None
+            else:
+                logger.info(
+                    "EarlyTom video token compression enabled: %s",
+                    self.earlytom_cfg,
+                )
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.visual = Qwen2_5_VisionTransformer(
@@ -1581,6 +1646,101 @@ class Qwen2_5_VLForConditionalGeneration(
             video_embeds_out.append(emb)
         return tuple(video_embeds_out)
 
+    def _process_video_input_earlytom(
+        self, video_input: Qwen2_5_VLVideoInputs
+    ) -> tuple[torch.Tensor, ...]:
+        """EarlyTom replacement for _process_video_input + EVS postprocess.
+
+        Runs the vision tower with in-encoder temporal frame merging and
+        attention-saliency capture, then applies EarlyTom outer compression
+        (global attention top-k + DPC-KNN for segment-boundary frames,
+        local-window top-k for static frames) down to exactly the EVS token
+        budget, so the processor-side placeholder count still matches.
+        """
+        grid_thw = video_input["video_grid_thw"]
+        assert grid_thw.ndim == 2
+        grid_thw_list = grid_thw.tolist()
+        merge_size = self.visual.spatial_merge_size
+
+        if video_input["type"] == "video_embeds":
+            # No encoder pass -> no saliency; fall back to plain EVS.
+            logger.warning_once(
+                "EarlyTom does not support precomputed video_embeds; "
+                "falling back to EVS for this request."
+            )
+            video_embeds = self._process_video_input(video_input)
+            return self._postprocess_video_embeds_evs(
+                video_embeds, video_input
+            )
+        if self.use_data_parallel:
+            raise NotImplementedError(
+                "EarlyTom is not supported with mm_encoder_tp_mode='data'"
+            )
+
+        pixel_values_videos = video_input["pixel_values_videos"]
+        video_embeds = self.visual(
+            pixel_values_videos,
+            grid_thw=grid_thw_list,
+            earlytom_cfg=self.earlytom_cfg,
+        )
+        aux_list = self.visual.pop_earlytom_aux()
+        assert aux_list is not None and len(aux_list) == len(grid_thw_list)
+
+        second_per_grid_ts = video_input.get("second_per_grid_ts")
+        if second_per_grid_ts is None:
+            raise ValueError(
+                "second_per_grid_ts is required when video_pruning_rate > 0"
+            )
+        second_per_grid_ts = second_per_grid_ts.long()
+        tokens_per_second = self.config.vision_config.tokens_per_second
+
+        # The encoder merged frames, so per-video output sizes are dynamic.
+        sizes = [
+            aux.frame_origin.numel()
+            * (size[1] // merge_size)
+            * (size[2] // merge_size)
+            for aux, size in zip(aux_list, grid_thw_list)
+        ]
+        video_embeds_split = video_embeds.split(sizes)
+
+        video_embeds_out = []
+        for emb, aux, size, video_second_per_grid_t in zip(
+            video_embeds_split, aux_list, grid_thw_list, second_per_grid_ts
+        ):
+            T, H, W = map(int, size)
+            tokens_per_frame = (H // merge_size) * (W // merge_size)
+            n_keep = compute_retained_tokens_count(
+                tokens_per_frame, T, self.video_pruning_rate
+            )
+            emb, retention_mask = outer_compress(
+                emb,
+                aux,
+                tokens_per_frame,
+                T,
+                n_keep,
+                self.earlytom_cfg,
+            )
+            logger.info(
+                "EarlyTom: frames %d -> %d (segments=%s), "
+                "tokens %d -> %d (budget %d)",
+                T,
+                aux.frame_origin.numel(),
+                aux.segments,
+                T * tokens_per_frame,
+                emb.size(0),
+                n_keep,
+            )
+            positions = compute_mrope_for_media(
+                size,
+                merge_size,
+                tokens_per_second=tokens_per_second,
+                video_second_per_grid=video_second_per_grid_t.item(),
+            ).to(emb.device, non_blocking=True)
+            positions = positions[retention_mask]
+            emb = torch.cat([emb, positions], dim=1)
+            video_embeds_out.append(emb)
+        return tuple(video_embeds_out)
+
     def recompute_mrope_positions(
         self,
         input_ids: list[int] | torch.Tensor,
@@ -1685,11 +1845,21 @@ class Qwen2_5_VLForConditionalGeneration(
                     )
                 multimodal_embeddings += tuple(image_embeddings)
             if modality == "video":
-                video_embeddings = self._process_video_input(multimodal_input)
-                if self.is_multimodal_pruning_enabled:
-                    video_embeddings = self._postprocess_video_embeds_evs(
-                        video_embeddings, multimodal_input
+                if (
+                    self.is_multimodal_pruning_enabled
+                    and self.earlytom_cfg is not None
+                ):
+                    video_embeddings = self._process_video_input_earlytom(
+                        multimodal_input
                     )
+                else:
+                    video_embeddings = self._process_video_input(
+                        multimodal_input
+                    )
+                    if self.is_multimodal_pruning_enabled:
+                        video_embeddings = self._postprocess_video_embeds_evs(
+                            video_embeddings, multimodal_input
+                        )
                 multimodal_embeddings += tuple(video_embeddings)
         return multimodal_embeddings
 
